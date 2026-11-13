@@ -2,13 +2,17 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 
-let db: Database.Database | undefined;
+export type Db = Database.Database;
 
-export function getDb(): Database.Database {
-  if (db) return db;
-  const dbPath = path.resolve(process.env.AEGIS_DB_PATH ?? "./data/aegis.db");
-  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  db = new Database(dbPath);
+let singleton: Db | undefined;
+
+export function createDb(dbPath: string): Db {
+  let target = dbPath;
+  if (dbPath !== ":memory:") {
+    target = path.resolve(dbPath);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+  }
+  const db = new Database(target);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.exec(`
@@ -44,4 +48,9 @@ export function getDb(): Database.Database {
     );
   `);
   return db;
+}
+
+export function getDb(): Db {
+  if (!singleton) singleton = createDb(process.env.AEGIS_DB_PATH ?? "./data/aegis.db");
+  return singleton;
 }
