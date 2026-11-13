@@ -54,6 +54,18 @@ describe("submitPaymentRequest", () => {
     expect(submit("INV-5", "12")).toMatchObject({ status: "rejected", reason: "exceeds_daily_limit" });
   });
 
+  it("never approves more than the daily limit across many requests", () => {
+    // Six distinct invoices of 12 XRP: 4 x 12 = 48 <= 50 approved, the last 2 would exceed 50.
+    const results = [];
+    for (let i = 1; i <= 6; i++) results.push(submit(`INV-C${i}`, "12"));
+    const approved = results.filter((r) => r.status === "approved");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(approved.length).toBe(4);
+    expect(rejected.length).toBe(2);
+    expect(rejected.every((r) => r.reason === "exceeds_daily_limit")).toBe(true);
+    expect(approved.length * 12).toBeLessThanOrEqual(50);
+  });
+
   it("rejects an unknown vendor", () => {
     expect(submit("INV-1", "12", "nobody")).toMatchObject({ status: "rejected", reason: "unknown_or_inactive_vendor" });
   });

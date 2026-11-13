@@ -132,5 +132,5 @@ export function submitPaymentRequest(db: Db, input: PaymentInput, now: Date = ne
       amountXrp,
       idempotent: false,
     };
-  })();
+  }).immediate();
 }
