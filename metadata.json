@@ -1,0 +1,6 @@
+{
+  "name": "Aegis Treasury",
+  "description": "Autonomous finance control and deterministic XRPL policy enforcement dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
