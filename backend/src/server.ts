@@ -1,17 +1,19 @@
-import express from "express";
+import { createApp } from "./app.js";
+import { loadCfoTokenHash } from "./cfo-auth.js";
 import { getDb } from "./db.js";
+import { seedDefaults } from "./seed.js";
 
-getDb();
+const db = getDb();
+seedDefaults(db);
 
-const app = express();
-app.use(express.json());
+const cfoTokenHash = loadCfoTokenHash();
+if (!cfoTokenHash) {
+  console.warn("CFO_TOKEN not set: policy changes are disabled.");
+}
 
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", service: "aegis-treasury-backend" });
-});
+const app = createApp(db, cfoTokenHash);
 
 const port = Number(process.env.PORT ?? 4000);
-const host = process.env.HOST ?? "127.0.0.1";
-app.listen(port, host, () => {
-  console.log(`aegis-treasury-backend listening on http://${host}:${port}`);
+app.listen(port, "127.0.0.1", () => {
+  console.log(`aegis-treasury-backend listening on http://127.0.0.1:${port}`);
 });
