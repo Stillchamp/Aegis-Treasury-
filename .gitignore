@@ -5,3 +5,9 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Local secrets & SQLite databases
+.env
+.env.local
+backend/.env
+backend/data/*.db*

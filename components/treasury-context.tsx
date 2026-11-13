@@ -1,6 +1,6 @@
 'use client';
 
-import React, { createContext, useContext, useState, useCallback } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
 import {
   NavPath,
   TransactionRecord,
@@ -19,6 +19,14 @@ export interface ToastItem {
   id: string;
   message: string;
   tone: 'success' | 'error' | 'info';
+}
+
+interface BackendAuditRow {
+  id: number;
+  event_type: string;
+  actor: string;
+  payload: string;
+  created_at: string;
 }
 
 interface TreasuryContextValue {
@@ -48,7 +56,36 @@ interface TreasuryContextValue {
   requestCfoOverride: (txId: string) => void;
 }
 
+const CFO_TOKEN = process.env.NEXT_PUBLIC_CFO_TOKEN || 'cfo_demo_secret_token_2026';
+
 const TreasuryContext = createContext<TreasuryContextValue | null>(null);
+
+function parsePayload(raw: string): Record<string, unknown> {
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function pickStr(obj: Record<string, unknown>, keys: string[], fallback = ''): string {
+  for (const k of keys) {
+    if (obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== '') {
+      return String(obj[k]);
+    }
+  }
+  return fallback;
+}
+
+function pickNum(obj: Record<string, unknown>, keys: string[]): number | null {
+  for (const k of keys) {
+    if (obj[k] !== undefined && obj[k] !== null) {
+      const n = Number(obj[k]);
+      if (!Number.isNaN(n)) return n;
+    }
+  }
+  return null;
+}
 
 export function TreasuryProvider({ children }: { children: React.ReactNode }) {
   const [activePath, setActivePath] = useState<NavPath>('overview');
@@ -59,9 +96,10 @@ export function TreasuryProvider({ children }: { children: React.ReactNode }) {
   const [auditEvents, setAuditEvents] = useState<AuditEventRecord[]>(INITIAL_AUDIT_EVENTS);
   const [policies, setPolicies] = useState<SpendingPoliciesConfig>(INITIAL_POLICIES);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const [liveSettledXrp, setLiveSettledXrp] = useState<number>(0);
 
-  const treasuryBalanceXrp = 1250.0;
-  const spentTodayXrp = 18.0;
+  const treasuryBalanceXrp = Number((1250.0 - liveSettledXrp).toFixed(2));
+  const spentTodayXrp = Number((18.0 + liveSettledXrp).toFixed(2));
 
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -77,6 +115,168 @@ export function TreasuryProvider({ children }: { children: React.ReactNode }) {
     },
     [dismissToast]
   );
+
+  const syncFromBackend = useCallback(async () => {
+    try {
+      const [policyRes, auditRes] = await Promise.all([
+        fetch('/api/aegis/policy'),
+        fetch('/api/aegis/audit', {
+          headers: { 'x-cfo-token': CFO_TOKEN },
+        }),
+      ]);
+
+      if (policyRes.ok) {
+        const pData = (await policyRes.json()) as {
+          maxPerPaymentXrp?: string;
+          maxPerDayXrp?: string;
+        };
+        const single = Number(pData.maxPerPaymentXrp);
+        const daily = Number(pData.maxPerDayXrp);
+        if (!Number.isNaN(single) && !Number.isNaN(daily)) {
+          setPolicies((prev) => ({
+            ...prev,
+            maxSingleTxLimit: single,
+            dailyAggregateLimit: daily,
+          }));
+        }
+      }
+
+      if (auditRes.ok) {
+        const rows = (await auditRes.json()) as BackendAuditRow[];
+        if (Array.isArray(rows) && rows.length > 0) {
+          const txByInvoice = new Map<string, TransactionRecord>();
+          const liveAudits: AuditEventRecord[] = [];
+
+          // Process oldest to newest so worker execution events enrich earlier decision rows
+          const chronological = [...rows].reverse();
+
+          for (const row of chronological) {
+            const p = parsePayload(row.payload);
+            const isPolicy = row.event_type === 'policy.updated';
+            const invoiceId = pickStr(p, ['invoice', 'invoiceId', 'invoice_id']);
+            const existingTx = invoiceId ? txByInvoice.get(invoiceId) : undefined;
+
+            const vendorId = pickStr(p, ['vendor', 'vendorId', 'vendor_id'], existingTx?.vendor || 'apex-auto-parts');
+            const amountNum = pickNum(p, ['amount', 'amountXrp', 'amount_xrp']) ?? (existingTx ? existingTx.amountXrp : null);
+            const statusStr = pickStr(p, ['status', 'decision']).toLowerCase();
+            const reason = pickStr(p, ['reason', 'error'], row.event_type);
+            const txRef = pickStr(p, ['txRef', 'tx_ref']);
+
+            const isBlocked = statusStr === 'rejected' || statusStr === 'blocked';
+            const isSettled =
+              statusStr === 'executed' ||
+              row.event_type === 'payment.executed' ||
+              row.event_type === 'payment.submitted' ||
+              Boolean(txRef);
+
+            const nextPolicy = (p.new as { maxPerPaymentXrp?: string; maxPerDayXrp?: string } | undefined);
+            const policySubtitle = nextPolicy
+              ? `Updated by CFO · Single cap: ${nextPolicy.maxPerPaymentXrp} XRP · Daily cap: ${nextPolicy.maxPerDayXrp} XRP`
+              : `Updated by ${row.actor.toUpperCase()} · Enforced on backend`;
+
+            liveAudits.unshift({
+              id: `AUD-${9942 + row.id}`,
+              timeUtc: row.created_at ? new Date(row.created_at).toUTCString().slice(17, 25) + ' UTC' : 'Just now · UTC',
+              dayLabel: 'Today',
+              title: isPolicy
+                ? 'Human Policy Change: Spending limits updated'
+                : row.event_type === 'payment.executed'
+                  ? `XRPL Simulation Settled (${invoiceId || `EVT-${row.id}`})`
+                  : isBlocked
+                    ? `Agent Request Blocked (${invoiceId || `EVT-${row.id}`})`
+                    : `Agent Payment ${row.event_type.replace('payment.', '').toUpperCase()} (${invoiceId || `EVT-${row.id}`})`,
+              subtitle: isPolicy
+                ? policySubtitle
+                : `Vendor: ${vendorId} · ${txRef ? `Ref: ${txRef}` : `Reason: ${reason}`}`,
+              initiator: row.actor === 'cfo' ? 'Amara Okafor' : row.actor === 'executor' ? 'Auth Svc (Worker)' : 'Procure v2.4',
+              initiatorIcon: row.actor === 'cfo' ? 'human' : row.actor === 'executor' ? 'vault' : 'agent',
+              amountXrp: amountNum,
+              amountUsd: amountNum !== null ? Number((amountNum * 0.57).toFixed(2)) : null,
+              verdict: isPolicy ? 'GOVERNANCE' : isBlocked ? 'BLOCKED' : 'APPROVED',
+              categoryTypes: isPolicy ? ['human'] : isBlocked ? ['rejected'] : ['approved', 'onchain'],
+              proofHash: txRef || `0x${row.id.toString(16).padStart(8, '0')}...aegis`,
+              interceptionPoint: isPolicy ? 'CFO Policy API' : 'Aegis Enclave Gate',
+              summaryText: `Event "${row.event_type}" recorded at ${row.created_at}. Details: ${row.payload}`,
+              feeText: isBlocked || isPolicy ? '0.000000 XRP' : '0.000012 XRP (Simulated)',
+              xrplStatus: isPolicy ? 'SQLite Synced' : isBlocked ? 'Vetoed Pre-Sign' : isSettled ? 'Finalized (Simulation)' : 'Queued',
+              timelineSteps: [
+                {
+                  title: row.event_type,
+                  time: row.created_at,
+                  detail: `Actor: ${row.actor} · ${txRef || reason}`,
+                  status: isBlocked ? 'fail' : 'pass',
+                },
+              ],
+            });
+
+            if (!isPolicy && invoiceId) {
+              const resolvedAmount = amountNum ?? 0;
+              const resolvedStatus: 'Settled' | 'Blocked' | 'Pending' = isBlocked
+                ? 'Blocked'
+                : isSettled
+                  ? 'Settled'
+                  : existingTx?.status ?? 'Pending';
+
+              txByInvoice.set(invoiceId, {
+                id: invoiceId,
+                vendor: vendorId,
+                vendorSubtitle: 'Live Backend Counterparty',
+                purpose: `Autonomous Invoice ${invoiceId}`,
+                agent: 'Procurement Agent',
+                agentId: 'agt_procure_09',
+                amountXrp: resolvedAmount,
+                amountUsd: Number((resolvedAmount * 0.57).toFixed(2)),
+                timeDisplay: 'Today · Live',
+                timestampFull: row.created_at,
+                policySummary: isBlocked
+                  ? `Blocked: ${reason}`
+                  : existingTx?.policySummary || `Passed (${reason})`,
+                status: resolvedStatus,
+                xrplStatusLabel: isBlocked
+                  ? 'Blocked (Pre-Signing)'
+                  : resolvedStatus === 'Settled'
+                    ? 'Settled (Simulation)'
+                    : 'Approved · Queued',
+                ledgerRef: txRef || existingTx?.ledgerRef || (isBlocked ? 'Never Broadcast' : 'Pending Worker'),
+                senderVault: 'rApexTreasury...9kQ2',
+                payeeWallet: `r${vendorId.replace(/[^a-zA-Z0-9]/g, '')}...XRPL`,
+                invoiceRef: invoiceId,
+                auditProof: `aegis_live_${row.id}`,
+                checks: [
+                  {
+                    name: 'Aegis Independent Policy Engine',
+                    passed: !isBlocked,
+                    detail: `Decision: ${resolvedStatus} (${txRef || reason})`,
+                  },
+                ],
+                engineVerdict: isBlocked ? 'HARD REJECTION' : 'AUTHORIZED & SETTLED',
+                verdictExplanation: `Enforced by Aegis backend (${row.event_type}).`,
+              });
+            }
+          }
+
+          const liveTxs = Array.from(txByInvoice.values()).reverse();
+          const settledSum = liveTxs
+            .filter((t) => t.status === 'Settled')
+            .reduce((acc, t) => acc + t.amountXrp, 0);
+
+          setLiveSettledXrp(settledSum);
+          setAuditEvents([...liveAudits, ...INITIAL_AUDIT_EVENTS]);
+          if (liveTxs.length > 0) {
+            setTransactions([...liveTxs, ...INITIAL_TRANSACTIONS]);
+          }
+        }
+      }
+    } catch {
+      // Backend offline: retain current state
+    }
+  }, []);
+
+  useEffect(() => {
+    syncFromBackend();
+    const timer = setInterval(syncFromBackend, 2500);
+    return () => clearInterval(timer);
+  }, [syncFromBackend]);
 
   const appendAuditEvent = useCallback((event: Omit<AuditEventRecord, 'id'>) => {
     setAuditEvents((prev) => [
@@ -95,7 +295,7 @@ export function TreasuryProvider({ children }: { children: React.ReactNode }) {
       timeUtc: 'Just now · UTC',
       dayLabel: 'Today',
       title: 'Emergency Halt: All autonomous agents suspended',
-      subtitle: 'HSM dispatch keys revoked on XRPL Testnet · Freeze Active',
+      subtitle: 'HSM dispatch keys revoked · Freeze Active',
       initiator: 'Amara Okafor',
       initiatorIcon: 'human',
       amountXrp: null,
@@ -103,10 +303,9 @@ export function TreasuryProvider({ children }: { children: React.ReactNode }) {
       verdict: 'GOVERNANCE',
       categoryTypes: ['human'],
       proofHash: '0xf920ab12...77d1',
-      interceptionPoint: 'Emergency Kill Switch',
-      summaryText:
-        'Finance Administrator Amara Okafor broadcast an emergency pause across all autonomous verification enclaves.',
-      feeText: '0.000000 XRP (Enclave Halt)',
+      interceptionPoint: 'Emergency KillSwitch',
+      summaryText: 'Finance Administrator broadcast an emergency pause across all agents.',
+      feeText: '0.000000 XRP',
       xrplStatus: 'Keys Suspended',
       timelineSteps: [
         {
@@ -115,47 +314,16 @@ export function TreasuryProvider({ children }: { children: React.ReactNode }) {
           detail: 'Emergency halt broadcast by Amara Okafor.',
           status: 'fail',
         },
-        {
-          title: 'Enclave Signing Revoked',
-          time: '00:00.029',
-          detail: 'All outbound agent SpendProposals quarantined.',
-          status: 'neutral',
-        },
       ],
     });
-    pushToast('Emergency pause signal broadcast to isolated verification enclaves. All autonomous agent dispatches suspended.', 'error');
+    pushToast('Emergency pause signal broadcast. All autonomous agent dispatches suspended.', 'error');
   }, [appendAuditEvent, pushToast]);
 
   const resumeAllAgents = useCallback(() => {
     setAgents((prev) => prev.map((a) => ({ ...a, status: 'Active' })));
     setPolicies((prev) => ({ ...prev, emergencyFreeze: false }));
-    appendAuditEvent({
-      timeUtc: 'Just now · UTC',
-      dayLabel: 'Today',
-      title: 'Human Policy Change: Autonomous agents resumed',
-      subtitle: 'Emergency freeze lifted by Finance Administrator',
-      initiator: 'Amara Okafor',
-      initiatorIcon: 'human',
-      amountXrp: null,
-      amountUsd: null,
-      verdict: 'GOVERNANCE',
-      categoryTypes: ['human'],
-      proofHash: '0x219ac831...10ef',
-      interceptionPoint: 'Human Governance Console',
-      summaryText: 'Finance Administrator restored normal policy enforcement across active daemons.',
-      feeText: '0.000000 XRP',
-      xrplStatus: 'Enclave Active',
-      timelineSteps: [
-        {
-          title: 'Operator Re-Authorization',
-          time: '00:00.018',
-          detail: 'Amara Okafor lifted Emergency Freeze.',
-          status: 'pass',
-        },
-      ],
-    });
     pushToast('Autonomous agent verification enclaves resumed.', 'success');
-  }, [appendAuditEvent, pushToast]);
+  }, [pushToast]);
 
   const toggleAgentStatus = useCallback(
     (agentKey: string) => {
@@ -172,40 +340,15 @@ export function TreasuryProvider({ children }: { children: React.ReactNode }) {
         })
       );
       if (targetName) {
-        appendAuditEvent({
-          timeUtc: 'Just now · UTC',
-          dayLabel: 'Today',
-          title: `${targetName} ${nextStatus === 'Paused' ? 'paused' : 'resumed'} by operator`,
-          subtitle: `Worker node execution state changed to ${nextStatus}`,
-          initiator: 'Amara Okafor',
-          initiatorIcon: 'human',
-          amountXrp: null,
-          amountUsd: null,
-          verdict: 'GOVERNANCE',
-          categoryTypes: ['human'],
-          proofHash: '0x6a91d201...31be',
-          interceptionPoint: 'Agent Registry Control',
-          summaryText: `${targetName} transitioned to ${nextStatus} state via Aegis Control Panel.`,
-          feeText: '0.000000 XRP',
-          xrplStatus: nextStatus === 'Paused' ? 'Execution Halted' : 'Active',
-          timelineSteps: [
-            {
-              title: 'Operator Intent Verified',
-              time: '00:00.014',
-              detail: `${targetName} set to ${nextStatus}.`,
-              status: nextStatus === 'Paused' ? 'fail' : 'pass',
-            },
-          ],
-        });
         pushToast(
           nextStatus === 'Paused'
-            ? `Confirmed: ${targetName} execution halted. Pending settlement requests quarantined.`
-            : `${targetName} resumed and synchronized with XRPL Testnet.`,
+            ? `Confirmed: ${targetName} execution halted.`
+            : `${targetName} resumed and synchronized.`,
           nextStatus === 'Paused' ? 'info' : 'success'
         );
       }
     },
-    [appendAuditEvent, pushToast]
+    [pushToast]
   );
 
   const addAgent = useCallback(
@@ -218,7 +361,7 @@ export function TreasuryProvider({ children }: { children: React.ReactNode }) {
         version: 'v1.0.0',
         host: webhook.trim() || 'ERP Webhook Daemon',
         nodeId: `agt_ext_${Date.now().toString().slice(-4)}`,
-        purpose: `Provisioned sandbox agent bound to ${policy}. Evaluates structured SpendProposals via isolated enclave.`,
+        purpose: `Provisioned sandbox agent bound to ${policy}.`,
         status: 'Active',
         modeLabel: policy.includes('Read-Only') ? 'Read-Only Auditing' : 'Autonomous Execution',
         readOnly: policy.includes('Read-Only'),
@@ -229,19 +372,12 @@ export function TreasuryProvider({ children }: { children: React.ReactNode }) {
         budgetConsumed: 0,
         budgetCap: policies.dailyAggregateLimit,
         singleTxCap: policies.maxSingleTxLimit,
-        allowedScopes: ['Request supplier payments ≤ cap', 'Query approved vendor directory'],
+        allowedScopes: ['Request supplier payments within cap', 'Query approved vendor directory'],
         blockedScopes: ['CANNOT modify spending limits', 'CANNOT access vault keys'],
-        activityFeed: [
-          {
-            time: 'Just now',
-            verdict: 'VERIFIED_SETTLED',
-            title: 'Ed25519 sandbox keypair provisioned',
-            detail: `Bound to ${policy}`,
-          },
-        ],
+        activityFeed: [],
       };
       setAgents((prev) => [...prev, newAgent]);
-      pushToast(`Agent sandbox key generated for "${cleanName}". Ephemeral Ed25519 token provisioned.`, 'success');
+      pushToast(`Agent sandbox key generated for "${cleanName}".`, 'success');
     },
     [policies.dailyAggregateLimit, policies.maxSingleTxLimit, pushToast]
   );
@@ -255,43 +391,26 @@ export function TreasuryProvider({ children }: { children: React.ReactNode }) {
         } else if (next.emergencyFreeze === false) {
           setAgents((aPrev) => aPrev.map((a) => ({ ...a, status: 'Active' })));
         }
-        appendAuditEvent({
-          timeUtc: 'Just now · UTC',
-          dayLabel: 'Today',
-          title: 'Human Policy Change: Spending Policy matrix updated',
-          subtitle: `Daily limit ${updated.dailyAggregateLimit.toFixed(2)} XRP · Max single ${updated.maxSingleTxLimit.toFixed(2)} XRP`,
-          initiator: 'Amara Okafor',
-          initiatorIcon: 'human',
-          amountXrp: null,
-          amountUsd: null,
-          verdict: 'GOVERNANCE',
-          categoryTypes: ['human'],
-          proofHash: '0x7f4e92a1...c890',
-          interceptionPoint: 'Human Governance Console',
-          summaryText:
-            'Hardware-enforced treasury parameter update signed via WebAuthn and synchronized with verification enclaves.',
-          feeText: '0.000000 XRP',
-          xrplStatus: 'Enclave Synced',
-          timelineSteps: [
-            {
-              title: 'WebAuthn Verification',
-              time: '00:00.022',
-              detail: 'Amara Okafor signed policy delta.',
-              status: 'pass',
-            },
-            {
-              title: 'Enclave Sync Complete',
-              time: '00:00.041',
-              detail: `Daily Cap: ${updated.dailyAggregateLimit.toFixed(2)} XRP | Single Cap: ${updated.maxSingleTxLimit.toFixed(2)} XRP.`,
-              status: 'pass',
-            },
-          ],
-        });
+
+        fetch('/api/aegis/policy', {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-cfo-token': CFO_TOKEN,
+          },
+          body: JSON.stringify({
+            maxPerPaymentXrp: String(updated.maxSingleTxLimit),
+            maxPerDayXrp: String(updated.dailyAggregateLimit),
+          }),
+        })
+          .then(() => syncFromBackend())
+          .catch(() => {});
+
         return updated;
       });
-      pushToast('Policy revision verified and synchronized across XRPL authorization enclaves.', 'success');
+      pushToast('Policy revision synced with Aegis backend SQLite enclave.', 'success');
     },
-    [appendAuditEvent, pushToast]
+    [pushToast, syncFromBackend]
   );
 
   const addVendor = useCallback(
@@ -311,80 +430,33 @@ export function TreasuryProvider({ children }: { children: React.ReactNode }) {
         walletShort: shortWallet,
         cumulativePaidXrp: 0,
         orderCountLabel: 'New Partner',
-        dateAdded: '12 May 2025',
+        dateAdded: 'Today',
       };
       setVendors((prev) => [newVendor, ...prev]);
-      appendAuditEvent({
-        timeUtc: 'Just now · UTC',
-        dayLabel: 'Today',
-        title: `Human Policy Change: Added vendor ${vendor.name}`,
-        subtitle: `Wallet ${shortWallet} · Single limit ${vendor.singleLimitXrp.toFixed(2)} XRP`,
-        initiator: 'Amara Okafor',
-        initiatorIcon: 'human',
-        amountXrp: null,
-        amountUsd: null,
-        verdict: 'GOVERNANCE',
-        categoryTypes: ['human'],
-        proofHash: '0x420b99e1...11c4',
-        interceptionPoint: 'Allowlist Registry',
-        summaryText: `Supplier wallet registered for ${vendor.name} (${vendor.status}).`,
-        feeText: '0.000000 XRP',
-        xrplStatus: 'Registry Updated',
-        timelineSteps: [
-          {
-            title: 'Base58 Wallet Format Validated',
-            time: '00:00.009',
-            detail: `${shortWallet} passed XRPL checksum validation.`,
-            status: 'pass',
-          },
-        ],
-      });
-      pushToast(`Vendor "${vendor.name}" queued for Administrator dual-sign approval.`, 'success');
+      pushToast(`Vendor "${vendor.name}" added to allowlist.`, 'success');
     },
-    [appendAuditEvent, pushToast]
+    [pushToast]
   );
 
   const updateVendorStatus = useCallback(
     (vendorId: string, status: VendorRecord['status']) => {
-      let vendorName = '';
-      setVendors((prev) =>
-        prev.map((v) => {
-          if (v.id === vendorId) {
-            vendorName = v.name;
-            return { ...v, status };
-          }
-          return v;
-        })
-      );
-      if (vendorName) {
-        pushToast(`${vendorName} status updated to ${status}.`, status === 'Deactivated' ? 'info' : 'success');
-      }
+      setVendors((prev) => prev.map((v) => (v.id === vendorId ? { ...v, status } : v)));
+      pushToast(`Vendor status updated to ${status}.`, status === 'Deactivated' ? 'info' : 'success');
     },
     [pushToast]
   );
 
   const updateVendorLimit = useCallback(
     (vendorId: string, newLimit: number) => {
-      let vendorName = '';
-      setVendors((prev) =>
-        prev.map((v) => {
-          if (v.id === vendorId) {
-            vendorName = v.name;
-            return { ...v, singleLimitXrp: newLimit };
-          }
-          return v;
-        })
-      );
-      if (vendorName) {
-        pushToast(`Updated single payment limit for ${vendorName} to ${newLimit.toFixed(2)} XRP.`, 'success');
-      }
+      setVendors((prev) => prev.map((v) => (v.id === vendorId ? { ...v, singleLimitXrp: newLimit } : v)));
+      pushToast(`Updated single payment limit to ${newLimit.toFixed(2)} XRP.`, 'success');
     },
     [pushToast]
   );
 
   const flagAgentTransaction = useCallback(
     (txId: string) => {
-      pushToast(`Flagged ${txId} for anomaly review and attached trace to compliance log.`, 'info');
+      pushToast(`Flagged ${txId} for anomaly review.`, 'info');
     },
     [pushToast]
   );
@@ -394,15 +466,11 @@ export function TreasuryProvider({ children }: { children: React.ReactNode }) {
       setTransactions((prev) =>
         prev.map((tx) =>
           tx.id === txId
-            ? {
-                ...tx,
-                xrplStatusLabel: 'Override Pending CFO',
-                ledgerRef: 'Escrow Review #409',
-              }
+            ? { ...tx, xrplStatusLabel: 'Override Pending CFO', ledgerRef: 'Escrow Review #409' }
             : tx
         )
       );
-      pushToast(`Dual-key WebAuthn CFO override request queued for ${txId}.`, 'info');
+      pushToast(`Dual-key CFO override request queued for ${txId}.`, 'info');
     },
     [pushToast]
   );
