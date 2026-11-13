@@ -120,6 +120,8 @@ public/
 
 Planned backend: Node.js, TypeScript, Express and SQLite.
 
+Current backend status (simulated execution only, no XRPL connection): see [backend/README.md](backend/README.md).
+
 XRPL integration: `xrpl.js` on XRP Ledger Testnet.
 
 Planned MCP tools:
