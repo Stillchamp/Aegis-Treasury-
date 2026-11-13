@@ -1,9 +1,10 @@
 import express from "express";
 import { z } from "zod";
 import { InvalidAmountError, parseXrpToDrops } from "./amounts.js";
+import { requireAgent, requireAgentOrCfo } from "./agent-auth.js";
 import { requireCfo } from "./cfo-auth.js";
 import type { Db } from "./db.js";
-import { submitPaymentRequest } from "./payments.js";
+import { LockBusyError, submitPaymentRequest } from "./payments.js";
 
 const amountField = z.string().refine(
   (v) => {
@@ -32,7 +33,7 @@ interface PolicyRow {
   updated_at: string;
 }
 
-export function createApp(db: Db, cfoTokenHash?: string): express.Express {
+export function createApp(db: Db, cfoTokenHash?: string, agentTokenHash?: string): express.Express {
   const app = express();
   app.use(express.json());
 
@@ -89,7 +90,7 @@ export function createApp(db: Db, cfoTokenHash?: string): express.Express {
     res.json(updated);
   });
 
-  app.post("/payments", (req, res) => {
+  app.post("/payments", requireAgent(agentTokenHash), (req, res) => {
     const parsed = paymentBody.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: "invalid_request", issues: parsed.error.issues.map((i) => i.path.join(".")) });
@@ -99,20 +100,36 @@ export function createApp(db: Db, cfoTokenHash?: string): express.Express {
     res.status(result.status === "conflict" ? 409 : 200).json(result);
   });
 
-  app.get("/payments/:invoiceId", (req, res) => {
-    const row = db.prepare("SELECT * FROM payment_requests WHERE invoice_id = ?").get(req.params.invoiceId);
+  app.get("/payments/:invoiceId", requireAgentOrCfo(agentTokenHash, cfoTokenHash), (req, res) => {
+    const row = db
+      .prepare(
+        "SELECT id, invoice_id, vendor_id, amount_xrp, status, reason, created_at FROM payment_requests WHERE invoice_id = ?",
+      )
+      .get(req.params.invoiceId);
     if (!row) {
       res.status(404).json({ error: "not_found" });
       return;
     }
-    res.json(row);
+    // Read only. Execution mode and reference come from the latest attempt, if any.
+    const attempt = db
+      .prepare("SELECT execution_mode, tx_ref FROM payment_attempts WHERE invoice_id = ? ORDER BY fencing_token DESC LIMIT 1")
+      .get(req.params.invoiceId) as { execution_mode: string; tx_ref: string | null } | undefined;
+    res.json({
+      ...(row as object),
+      executionMode: attempt?.execution_mode ?? "none",
+      txRef: attempt?.tx_ref ?? null,
+    });
   });
 
-  app.get("/audit", (_req, res) => {
+  app.get("/audit", requireCfo(cfoTokenHash), (_req, res) => {
     res.json(db.prepare("SELECT * FROM audit_log ORDER BY id DESC LIMIT 50").all());
   });
 
   app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (err instanceof LockBusyError) {
+      res.status(503).json({ error: "lock_busy" });
+      return;
+    }
     const status = (err as { status?: number })?.status;
     if (status === 400) {
       res.status(400).json({ error: "invalid_json" });

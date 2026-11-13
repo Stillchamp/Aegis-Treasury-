@@ -13,6 +13,7 @@ export function createDb(dbPath: string): Db {
     fs.mkdirSync(path.dirname(target), { recursive: true });
   }
   const db = new Database(target);
+  db.pragma("busy_timeout = 5000");
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.exec(`
@@ -44,6 +45,26 @@ export function createDb(dbPath: string): Db {
       event_type TEXT NOT NULL,
       actor TEXT NOT NULL,
       payload TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS payment_attempts (
+      attempt_id TEXT PRIMARY KEY,
+      invoice_id TEXT NOT NULL,
+      worker_id TEXT NOT NULL,
+      fencing_token INTEGER NOT NULL,
+      state TEXT NOT NULL, -- claimed, submitted, validated, failed_confirmed, uncertain
+      execution_mode TEXT NOT NULL,
+      tx_ref TEXT,
+      lease_expires_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (invoice_id, fencing_token)
+    );
+    CREATE TABLE IF NOT EXISTS rejected_requests (
+      invoice_id TEXT PRIMARY KEY,
+      vendor_id TEXT NOT NULL,
+      amount_xrp TEXT NOT NULL,
+      reason TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
   `);

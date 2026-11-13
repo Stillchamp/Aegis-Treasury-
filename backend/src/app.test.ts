@@ -7,13 +7,15 @@ import { hashToken } from "./cfo-auth.js";
 import { createDb } from "./db.js";
 import { seedDefaults } from "./seed.js";
 
-const token = crypto.randomBytes(16).toString("hex");
+const rand = () => crypto.randomBytes(16).toString("hex");
+const token = rand();
+const agentToken = rand();
 const servers: http.Server[] = [];
 
-async function start(cfoHash: string | undefined): Promise<string> {
+async function start(cfoHash: string | undefined, agentHash: string | undefined): Promise<string> {
   const db = createDb(":memory:");
   seedDefaults(db);
-  const server = createApp(db, cfoHash).listen(0, "127.0.0.1");
+  const server = createApp(db, cfoHash, agentHash).listen(0, "127.0.0.1");
   servers.push(server);
   await new Promise<void>((resolve) => server.once("listening", () => resolve()));
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -26,12 +28,17 @@ const call = (base: string, method: string, path: string, body?: unknown, header
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 
+const CFO = () => ({ "x-cfo-token": token });
+const AGENT = () => ({ "x-agent-token": agentToken });
+const pay = (base: string, body: unknown, headers: Record<string, string> = AGENT()) =>
+  call(base, "POST", "/payments", body, headers);
+
 let base: string;
 let noTokenBase: string;
 
 beforeAll(async () => {
-  base = await start(hashToken(token));
-  noTokenBase = await start(undefined);
+  base = await start(hashToken(token), hashToken(agentToken));
+  noTokenBase = await start(undefined, undefined);
 });
 
 afterAll(async () => {
@@ -39,82 +46,100 @@ afterAll(async () => {
 });
 
 describe("HTTP API", () => {
-  it("GET /health", async () => {
+  it("GET /health is public", async () => {
     const res = await call(base, "GET", "/health");
     expect(await res.json()).toEqual({ status: "ok", service: "aegis-treasury-backend" });
   });
 
-  it("GET /policy returns seeded limits", async () => {
+  it("GET /policy is public and returns seeded limits", async () => {
     const body = await (await call(base, "GET", "/policy")).json();
     expect(body).toMatchObject({ maxPerPaymentXrp: "20", maxPerDayXrp: "50" });
   });
 
-  it("PUT /policy without header -> 401", async () => {
-    const res = await call(base, "PUT", "/policy", { maxPerPaymentXrp: "40", maxPerDayXrp: "50" });
-    expect(res.status).toBe(401);
-  });
-
-  it("PUT /policy with wrong token -> 403", async () => {
-    const wrong = crypto.randomBytes(16).toString("hex");
-    const res = await call(base, "PUT", "/policy", { maxPerPaymentXrp: "40", maxPerDayXrp: "50" }, { "x-cfo-token": wrong });
-    expect(res.status).toBe(403);
-  });
-
-  it("PUT /policy with invalid amount -> 400", async () => {
-    const res = await call(base, "PUT", "/policy", { maxPerPaymentXrp: "abc", maxPerDayXrp: "50" }, { "x-cfo-token": token });
-    expect(res.status).toBe(400);
+  it("PUT /policy without header -> 401, wrong token -> 403, bad amount -> 400", async () => {
+    const body = { maxPerPaymentXrp: "40", maxPerDayXrp: "50" };
+    expect((await call(base, "PUT", "/policy", body)).status).toBe(401);
+    expect((await call(base, "PUT", "/policy", body, { "x-cfo-token": rand() })).status).toBe(403);
+    const bad = await call(base, "PUT", "/policy", { maxPerPaymentXrp: "abc", maxPerDayXrp: "50" }, CFO());
+    expect(bad.status).toBe(400);
   });
 
   it("policy change and payments flow", async () => {
+    const vendor = "apex-auto-parts";
     // Before the change a 35 XRP payment is over the per-payment limit of 20.
-    const before = await call(base, "POST", "/payments", { invoiceId: "INV-0", vendorId: "apex-auto-parts", amountXrp: "35" });
+    const before = await pay(base, { invoiceId: "INV-0", vendorId: vendor, amountXrp: "35" });
     expect((await before.json()).reason).toBe("exceeds_per_payment_limit");
 
-    const put = await call(base, "PUT", "/policy", { maxPerPaymentXrp: "40", maxPerDayXrp: "50" }, { "x-cfo-token": token });
+    const put = await call(base, "PUT", "/policy", { maxPerPaymentXrp: "40", maxPerDayXrp: "50" }, CFO());
     expect(put.status).toBe(200);
     expect((await put.json()).maxPerPaymentXrp).toBe("40");
     expect((await (await call(base, "GET", "/policy")).json()).maxPerPaymentXrp).toBe("40");
 
-    const big = await call(base, "POST", "/payments", { invoiceId: "INV-1", vendorId: "apex-auto-parts", amountXrp: "35" });
+    const big = await pay(base, { invoiceId: "INV-1", vendorId: vendor, amountXrp: "35" });
     expect(big.status).toBe(200);
     expect((await big.json()).status).toBe("approved");
 
     // 35 + 12 = 47 <= 50 daily limit.
-    const pay = { invoiceId: "INV-2", vendorId: "apex-auto-parts", amountXrp: "12" };
-    expect((await (await call(base, "POST", "/payments", pay)).json()).idempotent).toBe(false);
-    const again = await (await call(base, "POST", "/payments", pay)).json();
-    expect(again).toMatchObject({ status: "approved", idempotent: true });
+    const p2 = { invoiceId: "INV-2", vendorId: vendor, amountXrp: "12" };
+    expect((await (await pay(base, p2)).json()).idempotent).toBe(false);
+    expect(await (await pay(base, p2)).json()).toMatchObject({ status: "approved", idempotent: true });
+    expect((await pay(base, { ...p2, amountXrp: "13" })).status).toBe(409);
 
-    const conflict = await call(base, "POST", "/payments", { ...pay, amountXrp: "13" });
-    expect(conflict.status).toBe(409);
-
-    const bad = await call(base, "POST", "/payments", { invoiceId: "INV-3", vendorId: "apex-auto-parts", amountXrp: "-1" });
+    const bad = await pay(base, { invoiceId: "INV-3", vendorId: vendor, amountXrp: "-1" });
     expect(bad.status).toBe(200);
     expect(await bad.json()).toMatchObject({ status: "rejected", reason: "invalid_amount" });
 
-    const row = await call(base, "GET", "/payments/INV-1");
-    expect((await row.json()).status).toBe("approved");
-    expect((await call(base, "GET", "/payments/NOPE")).status).toBe(404);
+    const row = await (await call(base, "GET", "/payments/INV-1", undefined, AGENT())).json();
+    expect(row).toMatchObject({ status: "approved", executionMode: "none", txRef: null });
+    expect((await call(base, "GET", "/payments/NOPE", undefined, AGENT())).status).toBe(404);
 
-    const approvals = ((await (await call(base, "GET", "/audit")).json()) as { event_type: string }[]).filter(
-      (e) => e.event_type === "payment.decision",
-    );
-    expect(approvals.length).toBe(4); // INV-0, INV-1, INV-2, INV-3; the repeat of INV-2 added none
+    const audit = (await (await call(base, "GET", "/audit", undefined, CFO())).json()) as { event_type: string }[];
+    expect(audit.filter((e) => e.event_type === "payment.decision").length).toBe(4); // the INV-2 replay added none
+    expect(audit.some((e) => e.event_type === "policy.updated")).toBe(true);
   });
 
-  it("GET /audit contains policy.updated", async () => {
-    const rows = (await (await call(base, "GET", "/audit")).json()) as { event_type: string; actor: string }[];
-    expect(rows.some((r) => r.event_type === "policy.updated" && r.actor === "cfo")).toBe(true);
+  it("invalid POST /payments body -> 400", async () => {
+    expect((await pay(base, { invoiceId: "", vendorId: "x", amountXrp: "1" })).status).toBe(400);
+  });
+});
+
+describe("route protection", () => {
+  const body = { invoiceId: "P-1", vendorId: "apex-auto-parts", amountXrp: "1" };
+
+  it("POST /payments: 401 missing, 403 wrong, 403 with the CFO token, 503 unconfigured", async () => {
+    expect((await pay(base, body, {})).status).toBe(401);
+    expect((await pay(base, body, { "x-agent-token": rand() })).status).toBe(403);
+    expect((await pay(base, body, CFO())).status).toBe(401); // CFO token is not an agent token
+    const res = await pay(noTokenBase, body, AGENT());
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "agent_token_not_configured" });
   });
 
-  it("rejects invalid POST /payments body with 400", async () => {
-    const res = await call(base, "POST", "/payments", { invoiceId: "", vendorId: "x", amountXrp: "1" });
-    expect(res.status).toBe(400);
+  it("GET /payments/:id: 401 missing, 403 wrong, 200/404 with agent or CFO token, 503 unconfigured", async () => {
+    expect((await call(base, "GET", "/payments/X")).status).toBe(401);
+    expect((await call(base, "GET", "/payments/X", undefined, { "x-agent-token": rand() })).status).toBe(403);
+    expect((await call(base, "GET", "/payments/X", undefined, { "x-cfo-token": rand() })).status).toBe(403);
+    expect((await call(base, "GET", "/payments/X", undefined, AGENT())).status).toBe(404);
+    expect((await call(base, "GET", "/payments/X", undefined, CFO())).status).toBe(404);
+    expect((await call(noTokenBase, "GET", "/payments/X", undefined, AGENT())).status).toBe(503);
+  });
+
+  it("GET /audit: CFO token only", async () => {
+    expect((await call(base, "GET", "/audit")).status).toBe(401);
+    expect((await call(base, "GET", "/audit", undefined, { "x-cfo-token": rand() })).status).toBe(403);
+    expect((await call(base, "GET", "/audit", undefined, AGENT())).status).toBe(401);
+    expect((await call(base, "GET", "/audit", undefined, CFO())).status).toBe(200);
+    expect((await call(noTokenBase, "GET", "/audit", undefined, CFO())).status).toBe(503);
   });
 
   it("PUT /policy with no configured token -> 503", async () => {
-    const any = crypto.randomBytes(16).toString("hex");
-    const res = await call(noTokenBase, "PUT", "/policy", { maxPerPaymentXrp: "40", maxPerDayXrp: "50" }, { "x-cfo-token": any });
+    const res = await call(noTokenBase, "PUT", "/policy", { maxPerPaymentXrp: "40", maxPerDayXrp: "50" }, { "x-cfo-token": rand() });
     expect(res.status).toBe(503);
+  });
+
+  it("never echoes a token in responses", async () => {
+    const res = await call(base, "GET", "/audit", undefined, { "x-cfo-token": agentToken });
+    const text = await res.text();
+    expect(text.includes(agentToken) || text.includes(token)).toBe(false);
   });
 });
