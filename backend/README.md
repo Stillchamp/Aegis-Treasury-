@@ -28,6 +28,7 @@ Express + TypeScript API on SQLite, with a policy engine, a simulated execution 
 - The MCP host reads `AGENT_TOKEN` from its own environment, so whoever runs that host can read it. This is an open decision.
 - Loopback binding plus the same OS user is a demo separation, not a security boundary.
 - An invalid amount sent for an unknown vendor is stored with reason `invalid_amount`, not `unknown_or_inactive_vendor`.
+- `executionMode` is `"none"` until the simulated worker has run for an invoice; only then does it read `"simulated"`.
 - A refused invoice is final. A new attempt needs a new `invoiceId`.
 - The concurrency tests spawn real processes and depend on timing (synchronized start); they are not a proof of correctness under all interleavings.
 - `get_treasury_status` returns policy and execution mode only, because `GET /audit` needs the CFO token, which the MCP process does not hold.
@@ -46,6 +47,7 @@ Edit `backend/.env` yourself. Set your own long random `CFO_TOKEN` and `AGENT_TO
 npm run dev                # API on 127.0.0.1:4000 (PORT overrides)
 npm run worker:simulation  # one simulated execution pass; needs AEGIS_EXECUTION_MODE=simulation
 npm run demo:simulation    # scripted scenario on backend/data/demo.db
+npm run demo:video         # alias of demo:simulation (deletes only data/demo.db, never aegis.db)
 npm test                   # unit, API, MCP and multi-process tests
 ```
 
@@ -63,3 +65,11 @@ The MCP server has no npm script. Run it over stdio with `node --import tsx src/
 | `GET /audit` | `x-cfo-token` | Last 50 audit rows |
 
 Common auth responses: **401** header missing, **403** wrong token, **503** the token is not configured on the server (`agent_token_not_configured`, `cfo_token_not_configured`). **503 `lock_busy`** means the database lock timed out; nothing was written.
+
+## Frontend notes
+
+- `GET /payments/:invoiceId` returns `executionMode` (`"none"` until executed, then `"simulated"`) and `txRef` (always `SIM-` prefixed, never a ledger hash).
+- `GET /audit` needs the CFO token (`x-cfo-token`).
+- `POST /payments` needs `x-agent-token`.
+- `PUT /policy` needs `x-cfo-token`.
+- The CFO token must never go in `NEXT_PUBLIC_*` variables, URLs, logs or persistent storage. For the local demo, the human CFO may type it in manually and the page keeps it in memory only.

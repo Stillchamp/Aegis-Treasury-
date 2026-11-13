@@ -9,7 +9,8 @@
     "start": "node dist/server.js",
     "test": "vitest run",
     "demo:simulation": "node --import tsx src/demo/scenario.ts",
-    "worker:simulation": "node --env-file=.env --import tsx src/worker.ts --once"
+    "worker:simulation": "node --env-file=.env --import tsx src/worker.ts --once",
+    "demo:video": "npm run demo:simulation"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
